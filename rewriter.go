@@ -36,7 +36,7 @@ type QueryRewriter struct {
 	Args []any
 }
 
-// RewriteQueryRewriter implements [pgx.QueryRewriterRewriter]. For every sentinel of
+// RewriteQuery implements [pgx.QueryRewriterRewriter]. For every sentinel of
 // the form /* ... query.<name> ... */ found in sql, if the named value
 // is non-empty, the sentinel is replaced with its own body (with
 // query.<name> swapped for the value) so the SQL author's chosen
