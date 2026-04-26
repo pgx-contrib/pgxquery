@@ -54,6 +54,12 @@ the positional parameters passed to `pool.Query` — so the `$1` above is filled
 from `Args[0]`. When `Where` or `OrderBy` is empty, its sentinel is stripped
 entirely, leaving the surrounding SQL valid.
 
+`$N` placeholders inside `Where` and `OrderBy` use **local numbering**: `$1`
+refers to `Args[0]`, `$2` to `Args[1]`, and so on. The rewriter shifts them
+by the count of base args so they hit the right slots in the final flat
+parameter list. Placeholders inside string literals, quoted identifiers,
+dollar-quoted bodies and SQL comments are left untouched.
+
 ## Development
 
 ### DevContainer

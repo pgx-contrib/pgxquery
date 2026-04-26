@@ -149,21 +149,243 @@ var _ = Describe("QueryRewriter", func() {
 			})
 		})
 
-		When("Where uses positional placeholders and Args supplies values", func() {
+		When("Where uses local placeholders and Args supplies values", func() {
 			BeforeEach(func() {
 				query = &pgxquery.QueryRewriter{
-					Where: "name = $2 AND score > $3",
+					Where: "name = $1 AND score > $2",
 					Args:  []any{"alice", 90},
 				}
 			})
 
-			It("passes placeholders through and appends Args after base args", func(ctx SpecContext) {
+			It("shifts placeholders past base args and appends Args", func(ctx SpecContext) {
 				fq := NewFakeQuery("006.sql", "acme")
 				sql, args, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(sql).To(ContainSubstring("AND name = $2 AND score > $3"))
 				Expect(args).To(Equal([]any{"acme", "alice", 90}))
+			})
+		})
+
+		When("Where contains $N inside string literals and dollar-quoted bodies", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "name = $1 AND note = 'literal $1 stays' AND body = $body$raw $1 stays$body$ AND score > $2",
+					Args:  []any{"alice", 90},
+				}
+			})
+
+			It("only shifts active placeholders, leaving quoted bodies untouched", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("name = $2"))
+				Expect(sql).To(ContainSubstring("'literal $1 stays'"))
+				Expect(sql).To(ContainSubstring("$body$raw $1 stays$body$"))
+				Expect(sql).To(ContainSubstring("score > $3"))
+			})
+		})
+
+		When("Where contains multi-digit placeholders", func() {
+			BeforeEach(func() {
+				args := make([]any, 12)
+				query = &pgxquery.QueryRewriter{
+					Where: "x = $1 AND y = $10 AND z = $12",
+					Args:  args,
+				}
+			})
+
+			It("shifts every placeholder by len(base args)", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("x = $2 AND y = $11 AND z = $13"))
+			})
+		})
+
+		When("OrderBy contains a placeholder", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					OrderBy: "CASE WHEN role = $1 THEN 0 ELSE 1 END",
+					Args:    []any{"admin"},
+				}
+			})
+
+			It("shifts the placeholder past the base args", func(ctx SpecContext) {
+				fq := NewFakeQuery("001.sql", "007", "Google", 0, 10)
+				sql, args, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring(", CASE WHEN role = $5 THEN 0 ELSE 1 END"))
+				Expect(args).To(Equal([]any{"007", "Google", 0, 10, "admin"}))
+			})
+		})
+
+		When("Where contains $N inside a quoted identifier", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: `"col$1" = $1`,
+					Args:  []any{"x"},
+				}
+			})
+
+			It("leaves the identifier body untouched and shifts the active placeholder", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring(`"col$1" = $2`))
+			})
+		})
+
+		When("Where contains $N inside line and block comments", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "x = $1 -- ignore $1 here\n   AND y = $2 /* and /* nested $1 */ stays */ AND z = $3",
+					Args:  []any{1, 2, 3},
+				}
+			})
+
+			It("only shifts placeholders outside comments", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("x = $2"))
+				Expect(sql).To(ContainSubstring("-- ignore $1 here"))
+				Expect(sql).To(ContainSubstring("AND y = $3"))
+				Expect(sql).To(ContainSubstring("/* and /* nested $1 */ stays */"))
+				Expect(sql).To(ContainSubstring("AND z = $4"))
+			})
+		})
+
+		When("Where contains escaped quotes and a lone dollar sign", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: `note = 'it''s $1 inside' AND price > $1 AND tag <> 'A' || '$' || 'B'`,
+					Args:  []any{42},
+				}
+			})
+
+			It("treats '' as an escape, leaves the lone $ alone, and shifts active placeholders", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring(`'it''s $1 inside'`))
+				Expect(sql).To(ContainSubstring("price > $2"))
+				Expect(sql).To(ContainSubstring(`'A' || '$' || 'B'`))
+			})
+		})
+
+		When("Where contains an empty-tag dollar-quoted body", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "raw = $$keep $1 raw$$ AND id = $1",
+					Args:  []any{7},
+				}
+			})
+
+			It("leaves $$...$$ bodies untouched and shifts active placeholders", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("$$keep $1 raw$$"))
+				Expect(sql).To(ContainSubstring("AND id = $2"))
+			})
+		})
+
+		When("Where ends with an unterminated string literal", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "x = $1 AND note = 'unterminated $1",
+					Args:  []any{1},
+				}
+			})
+
+			It("shifts placeholders before the open quote and leaves the rest opaque", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("x = $2"))
+				Expect(sql).To(ContainSubstring("'unterminated $1"))
+			})
+		})
+
+		When("Where ends with an unterminated dollar-quoted body", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "x = $1 AND raw = $tag$body $1 still raw",
+					Args:  []any{1},
+				}
+			})
+
+			It("shifts placeholders before the opener and leaves the rest opaque", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("x = $2"))
+				Expect(sql).To(ContainSubstring("$tag$body $1 still raw"))
+			})
+		})
+
+		When("Where contains lone dollar signs and an unclosed tag at EOF", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "x = $1 AND amount > $ AND label = $abc",
+					Args:  []any{1},
+				}
+			})
+
+			It("passes lone $ through and treats an unclosed tag opener as literal", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring("x = $2"))
+				Expect(sql).To(ContainSubstring("amount > $ "))
+				Expect(sql).To(ContainSubstring("label = $abc"))
+			})
+		})
+
+		When("Where contains a quoted identifier with escaped quotes and an unterminated identifier", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: `"weird""col $1" = $1 AND "open $1`,
+					Args:  []any{1},
+				}
+			})
+
+			It("treats \"\" as an escape and leaves the unterminated identifier opaque", func(ctx SpecContext) {
+				fq := NewFakeQuery("006.sql", "acme")
+				sql, _, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sql).To(ContainSubstring(`"weird""col $1" = $2`))
+				Expect(sql).To(ContainSubstring(`"open $1`))
+			})
+		})
+
+		When("the base query has no positional args (offset is zero)", func() {
+			BeforeEach(func() {
+				query = &pgxquery.QueryRewriter{
+					Where: "name = $1 AND score > $2",
+					Args:  []any{"alice", 90},
+				}
+			})
+
+			It("leaves placeholders unchanged", func(ctx SpecContext) {
+				sql := `SELECT * FROM t WHERE 1=1 /* AND query.where */`
+				out, args, err := query.RewriteQuery(ctx, nil, sql, nil)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(out).To(ContainSubstring("AND name = $1 AND score > $2"))
+				Expect(args).To(Equal([]any{"alice", 90}))
 			})
 		})
 
@@ -206,28 +428,7 @@ var _ = Describe("QueryRewriter", func() {
 				sql, args, err := query.RewriteQuery(ctx, nil, fq.SQL, fq.Arguments)
 
 				Expect(err).NotTo(HaveOccurred())
-				Expect(sql).To(Equal(`-- sqlfluff:dialect:postgres
--- sqlfluff:max_line_length:1024
--- sqlfluff:rules:capitalisation.keywords:capitalisation_policy:upper
-
-SELECT
-    id,
-    role,
-    company
-FROM
-    users
-WHERE
-    id::text >= $1::text
-    AND ($2::text IS NULL OR company::text = $2::text)
-    AND role = 'admin'
-ORDER BY
-    id
-    , name asc
-LIMIT
-    $4::int
-    OFFSET
-    $3::int;
-`))
+				Expect(sql).To(Equal(NewFakeQuery("001.expected.sql").SQL))
 				Expect(args).To(Equal([]any{"007", "Google", 0, 10, 100, 200}))
 			})
 		})
